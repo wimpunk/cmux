@@ -1,13 +1,17 @@
 Cmux
 ====
-This program enables GSM 0710 multiplexing using linux n_gsm line dicipline.
+
+This program enables GSM 0710 multiplexing using linux
+`n_gsm` line dicipline.
 
 How it works
 -------
+
 This program :
+
 * Opens modem device on serial line
 * Enables modem CMUX
-* Attaches n_gsm line dicipline
+* Attaches n\_gsm line dicipline
 * Creates virtual TTYs
 * Daemonizes and waits for signal
 * Removes the virtual TTYs
@@ -21,9 +25,9 @@ How to
 
 ```c
 /* serial port of the modem */
-#define SERIAL_PORT	"/dev/ttyS1"
+#define SERIAL\_PORT	"/dev/ttyS1"
 /* line speed */
-#define LINE_SPEED	B115200
+#define LINE\_SPEED	B115200
 ```
 
 * Change the AT commands set to fit your modem in `cmux.c`.
