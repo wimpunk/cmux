@@ -33,11 +33,14 @@
 #include <unistd.h>
 #include <err.h>
 #include <signal.h>
-/** 
-*	gsmmux.h provides n_gsm line dicipline structures and functions. 
+#include <stdint.h>
+#include <errno.h>
+/**
+*	gsmmux.h provides n_gsm line dicipline structures and functions.
 *	It should be kept in sync with your kernel release.
 */
 #include "gsmmux.h"
+#include "gpio.h"
 
 /* n_gsm ioctl */
 #ifndef N_GSM0710
@@ -50,29 +53,13 @@
 #endif
 
 /* serial port of the modem */
-#define SERIAL_PORT	"/dev/ttyS1"
+#define SERIAL_PORT	"/dev/ttyAMA0"
 
 /* line speed */
 #define LINE_SPEED	B115200
 
 /* maximum transfert unit (MTU), value in bytes */
-#define MTU	512
-
-/**
-* whether or not to create virtual TTYs for the multiplex
-*	0 : do not create
-*	1 : create
-*/
-#define CREATE_NODES	1
-
-/* number of virtual TTYs to create (most modems can handle up to 4) */
-#define NUM_NODES	4
-
-/* name of the virtual TTYs to create */
-#define BASENAME_NODES	"/dev/ttyGSM"
-
-/* name of the driver, used to get the major number */
-#define DRIVER_NAME	"gsmtty"
+#define MTU	98
 
 /**
 * whether or not to print debug messages to stderr
@@ -86,11 +73,17 @@
 *	0 : do not daemonize
 *	1 : daemonize
 */
-#define DAEMONIZE	1
+#define DAEMONIZE	0
 
  /* size of the reception buffer which gets data from the serial line */
 #define SIZE_BUF	256
 
+/* controling the GPIO on the modem */
+#define MODEM_POWERON (4*32+12)
+#define MODEM_RESET   (4*32+15)
+
+	int serial_fd;
+	struct gsm_config savegsm;
 
 /**
 *	Prints debug messages to stderr if debug is wanted
@@ -119,20 +112,39 @@ int send_at_command(int serial_fd, char *command) {
 	
 	char buf[SIZE_BUF];
 	int r;
+	fd_set rdfs;
+	struct timeval tv;
 
 	/* write the AT command to the serial line */
-	if (write(serial_fd, command, strlen(command)) <= 0)
+	if (write(serial_fd, command, strlen(command)) != strlen(command)) {
 		err(EXIT_FAILURE, "Cannot write to %s", SERIAL_PORT);
-	
-	/* wait a bit to allow the modem to rest */
-	sleep(1);
+		return -1;
+	}
 
 	/* read the result of the command from the modem */
 	memset(buf, 0, sizeof(buf));
+	FD_ZERO(&rdfs);
+	FD_SET(serial_fd, &rdfs);
+	tv.tv_sec = 5;
+	tv.tv_usec = 0;
+
+	r = select(serial_fd+1, &rdfs, NULL, NULL, &tv);
+	if (r == -1) {
+		err(EXIT_FAILURE, "Select error %s", strerror(errno));
+		return -1;
+	}
+
+	if (r == 0) {
+		err(EXIT_FAILURE, "Nothing to read after 5 seconds after sending %s",
+		command);
+		return -1;
+	}
+
 	r = read(serial_fd, buf, sizeof(buf));
+
 	if (r == -1)
-		err(EXIT_FAILURE, "Cannot read %s", SERIAL_PORT);
-	
+	err(EXIT_FAILURE, "Cannot read %s", SERIAL_PORT);
+
 	/* if there is no result from the modem, return failure */
 	if (r == 0) {
 		dbg("%s\t: No response", command);
@@ -140,30 +152,54 @@ int send_at_command(int serial_fd, char *command) {
 	}
 
 	/* if we have a result and want debug info, strip CR & LF out from the output */
+	r += read(serial_fd, buf+r, sizeof(buf)-r);
 	if (DEBUG) {
 		int i;
 		char bufp[SIZE_BUF];
 		memcpy(bufp, buf, sizeof(buf));
 		for(i=0; i<strlen(bufp); i++) {
-			if (bufp[i] == '\r' || bufp[i] == '\n')
+			if (bufp[i] == '\r' || bufp[i] == '\n') {
 				bufp[i] = ' ';
+			}
 		}
-		dbg("%s\t: %s", command, bufp);
+
+		memset(buf, 0, sizeof(buf));
+		memcpy(buf, command, strlen(command));
+		for(i=0; i<strlen(command); i++) {
+			if (buf[i] == '\r' || buf[i] == '\n') {
+				buf[i] = ' ';
+			}
+		}
+
+		dbg("%20s\t: %s", buf, bufp);
 	}
 
 	/* if the output shows "OK" return success */
 	if (strstr(buf, "OK\r") != NULL) {
 		return 0;
 	}
-	
-	return -1;		
+
+	return -1;
 
 }
 
 /**
 *	Function raised by signal catching
 */
+void stopModem();
 void signal_callback_handler(int signum) {
+
+	dbg("handling signal");
+
+    remove_nodes();
+	if (ioctl(serial_fd, GSMIOC_SETCONF, &savegsm) < 0)
+		err(EXIT_FAILURE, "Cannot set GSM multiplex parameters");
+
+	write(serial_fd, "+++\n", strlen("+++\n"));
+
+	close(serial_fd);
+	stopModem();
+
 	return;
 }
 
@@ -270,21 +306,85 @@ void remove_nodes(char *basename, int number_nodes) {
 	return;
 }
 
+void startModem() {
+
+		gpioExport(MODEM_POWERON);
+		gpioExport(MODEM_RESET);
+
+		gpioDirection(MODEM_POWERON, "out");
+		gpioDirection(MODEM_RESET, "out");
+
+		gpioSetValue(MODEM_POWERON, 1);
+		usleep(100000);
+		gpioSetValue(MODEM_POWERON, 0);
+		usleep(100000);
+
+		gpioSetValue(MODEM_RESET, 1);
+		usleep(100000);
+		gpioSetValue(MODEM_RESET, 0);
+		usleep(100000);
+		
+		sleep(2);
+
+}
+
+void stopModem() {
+		gpioSetValue(MODEM_RESET, 1);
+		gpioSetValue(MODEM_POWERON, 1);
+	}
+
+
+void waitSignal(int serial_fd) {
+
+	fd_set rdfs;
+	int r;
+	char buf[SIZE_BUF];
+	struct timeval tv;
+
+	FD_ZERO(&rdfs);
+	FD_SET(serial_fd, &rdfs);
+	tv.tv_sec = 10;
+	tv.tv_usec = 0;
+
+	r = select(serial_fd+1, &rdfs, NULL, NULL, &tv);
+
+	if (r<0) {
+		printf("Error while waiting for signal\n");
+	}
+	if (r==0) {
+		printf("Wait for signal didn't got any signal\n");
+	}
+	if (r>0) {
+		memset(buf, 0, sizeof(buf));
+		r = read(serial_fd, buf, sizeof(buf));
+		printf("waitSignal got %d bytes: %s", r, buf);
+		while (r == sizeof(buf)) {
+			memset(buf, 0, sizeof(buf));
+			r = read(serial_fd, buf, sizeof(buf));
+			printf("%s", buf);
+		}
+		printf("\n");
+	}
+
+}
+
 int main(void) {
 
-	int serial_fd, major;
+	int major;
 	struct termios tio;
 	int ldisc = N_GSM0710;
 	struct gsm_config gsm;
 	char atcommand[40];
 
+	startModem();
+
 	/* print global parameters */
-	dbg("SERIAL_PORT = %s", SERIAL_PORT);
+	// dbg("SERIAL_PORT = %s", SERIAL_PORT);
 
 	/* open the serial port */
 	serial_fd = open(SERIAL_PORT, O_RDWR | O_NOCTTY | O_NDELAY);
 	if (serial_fd == -1)
-		err(EXIT_FAILURE, "Cannot open %s", SERIAL_PORT);
+		err(EXIT_FAILURE, "Cannot open %s\n", SERIAL_PORT);
 	
 	/* get the current attributes of the serial port */
 	if (tcgetattr(serial_fd, &tio) == -1)
@@ -294,8 +394,9 @@ int main(void) {
 	tio.c_iflag = 0;
 	tio.c_oflag = 0;
 	tio.c_cflag = CS8 | CREAD | CLOCAL;
-	tio.c_cflag |= CRTSCTS;
+	tio.c_cflag &= ~CRTSCTS;
 	tio.c_lflag = 0;
+    tio.c_lflag &= ~ECHO;
 	tio.c_cc[VMIN] = 1;
 	tio.c_cc[VTIME] = 0;
 	
@@ -307,32 +408,45 @@ int main(void) {
 	if (tcsetattr(serial_fd, TCSANOW, &tio) == -1)
 		err(EXIT_FAILURE, "Cannot set line attributes");
 
+	waitSignal(serial_fd);
+
 	/**
 	*	Send AT commands to put the modem in CMUX mode.
 	*	This is vendor specific and should be changed 
 	*	to fit your modem needs.
 	*	The following matches Quectel M95.
 	*/
+	/*
 	if (send_at_command(serial_fd, "AT+IFC=2,2\r") == -1)
-		errx(EXIT_FAILURE, "AT+IFC=2,2: bad response");	
+		errx(EXIT_FAILURE, "AT+IFC=2,2: bad response");
 	if (send_at_command(serial_fd, "AT+GMM\r") == -1)
 		warnx("AT+GMM: bad response");
+		*/
 	if (send_at_command(serial_fd, "AT\r") == -1)
 		warnx("AT: bad response");
-	if (send_at_command(serial_fd, "AT+IPR=115200&w\r") == -1)
-		errx(EXIT_FAILURE, "AT+IPR=115200&w: bad response");
+		// AT+IPR=115200
+	if (send_at_command(serial_fd, "AT+IPR=115200\r") == -1)
+		warnx("AT+IPR=115200: bad response");
+	if (send_at_command(serial_fd, "AT+CMUX=?\r") == -1)
+		warnx("AT+CMUX: bad response");
+		/*
 	sprintf(atcommand, "AT+CMUX=0,0,5,%d,10,3,30,10,2\r", MTU);
+	*/
+	sprintf(atcommand, "AT+CMUX=0\r");
 	if (send_at_command(serial_fd, atcommand) == -1)
-		errx(EXIT_FAILURE, "Cannot enable modem CMUX");
+		warnx("Cannot enable modem CMUX");
+		// errx(EXIT_FAILURE, "Cannot enable modem CMUX");
 
 	/* use n_gsm line discipline */
-	sleep(2);
+	// sleep(2);
 	if (ioctl(serial_fd, TIOCSETD, &ldisc) < 0)
 		err(EXIT_FAILURE, "Cannot set line dicipline. Is 'n_gsm' module registred?");
 
 	/* get n_gsm configuration */
 	if (ioctl(serial_fd, GSMIOC_GETCONF, &gsm) < 0)
 		err(EXIT_FAILURE, "Cannot get GSM multiplex parameters");
+
+	savegsm  = gsm;
 
 	/* set and write new attributes */
 	gsm.initiator = 1;
@@ -347,35 +461,32 @@ int main(void) {
 	if (ioctl(serial_fd, GSMIOC_SETCONF, &gsm) < 0)
 		err(EXIT_FAILURE, "Cannot set GSM multiplex parameters");
 	dbg("Line dicipline set");
-	
-	/* create the virtual TTYs */
-	if (CREATE_NODES) {
-		int created;
-		if ((major = get_major(DRIVER_NAME)) < 0)
-			errx(EXIT_FAILURE, "Cannot get major number");
-		if ((created = make_nodes(major, BASENAME_NODES, NUM_NODES)) < NUM_NODES)
-			warnx("Cannot create all nodes, only %d/%d have been created.", created, NUM_NODES);
-	}
 
 	/* detach from the terminal if needed */
 	if (DAEMONIZE) {
 		dbg("Going to background");
 		if (daemon(0,0) != 0)
 			err(EXIT_FAILURE, "Cannot daemonize");
+	} else {
+		dbg("NOT Going to background");
 	}
 
 	/* wait to keep the line discipline enabled, wake it up with a signal */
 	signal(SIGINT, signal_callback_handler);
 	signal(SIGTERM, signal_callback_handler);
-	pause();
-	
-	/* remove the created virtual TTYs */
-	if (CREATE_NODES) {
-		remove_nodes(BASENAME_NODES, NUM_NODES);
-	}
+	sleep(2);
+	// pause();
+	dbg("Ending without pause");
+
+	/* TODO
+	It could be a nice idea to wait just 5 seconds
+	and quit if there's no pppd been started.
+	*/
 
 	/* close the serial line */
 	close(serial_fd);
+	/* put the modem into halt state */
+    stopModem();
 
 	return EXIT_SUCCESS;
 }
